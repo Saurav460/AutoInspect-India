@@ -1,3 +1,4 @@
+from huggingface_hub import hf_hub_download
 from fastapi import (
     FastAPI,
     UploadFile,
@@ -51,13 +52,11 @@ app.add_middleware(
 
 BASE_DIR = Path(__file__).resolve().parent
 
-MODEL_PATH = (
-    BASE_DIR
-    / "runs"
-    / "detect"
-    / "train-5"
-    / "weights"
-    / "best.pt"
+MODEL_PATH = Path(
+    hf_hub_download(
+        repo_id="Saurav460/AutoInspect-India-model",
+        filename="best.pt"
+    )
 )
 
 TEMP_DIR = BASE_DIR / "temp_uploads"
