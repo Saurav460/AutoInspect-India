@@ -1,0 +1,48 @@
+{
+    "before_image": "before_real_test.jpg",
+    "after_image": "after_real_test.jpg",
+    "existing_damage": [
+        {
+            "type": "glass shatter",
+            "confidence": 0.9051,
+            "iou": 0.9959
+        },
+        {
+            "type": "dent",
+            "confidence": 0.7377,
+            "iou": 0.9442
+        },
+        {
+            "type": "dent",
+            "confidence": 0.6056,
+            "iou": 0.9951
+        },
+        {
+            "type": "lamp broken",
+            "confidence": 0.5066,
+            "iou": 0.9956
+        },
+        {
+            "type": "crack",
+            "confidence": 0.6018,
+            "iou": 0.9544
+        }
+    ],
+    "potential_new_damage": [
+        {
+            "type": "dent",
+            "confidence": 0.612,
+            "bounding_box": [
+                75.06,
+                249.0,
+                187.83,
+                389.33
+            ]
+        }
+    ],
+    "summary": {
+        "existing_damage_count": 5,
+        "potential_new_damage_count": 1,
+        "overall_status": "Potential New Damage Detected"
+    }
+}
