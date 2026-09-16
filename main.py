@@ -1,38 +1,48 @@
-from huggingface_hub import hf_hub_download
 from fastapi import (
     FastAPI,
-    UploadFile,
     File,
-    HTTPException,
     Form,
+    UploadFile,
+    HTTPException,
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-from ultralytics import YOLO
-
 from pathlib import Path
 from datetime import datetime
-import uuid
+from typing import Optional
+from uuid import uuid4
 import json
 import os
+import shutil
 
-import cv2
+from huggingface_hub import hf_hub_download
+from ultralytics import YOLO
+from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.platypus import (
+    SimpleDocTemplate,
+    Paragraph,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
-
-# ============================================================
+# =========================================================
 # APP
-# ============================================================
+# =========================================================
 
 app = FastAPI(
     title="AutoInspect India API",
-    description="AI-powered vehicle damage inspection system",
+    description="AI Car Damage Detection and Inspection API",
     version="1.0.0",
 )
 
-
-# ============================================================
+# =========================================================
 # CORS
-# ============================================================
+# =========================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -46,52 +56,29 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
-# ============================================================
+# =========================================================
 # PATHS
-# ============================================================
+# =========================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-
-MODEL_PATH = Path(
-    hf_hub_download(
-        repo_id="Saurav460/AutoInspect-India-model",
-        filename="best.pt"
-    )
-)
 
 TEMP_DIR = BASE_DIR / "temp_uploads"
 REPORT_DIR = BASE_DIR / "reports"
 
-TEMP_DIR.mkdir(exist_ok=True)
-REPORT_DIR.mkdir(exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ============================================================
+# =========================================================
 # MODEL
-# ============================================================
+# =========================================================
 
-if not MODEL_PATH.exists():
-    raise RuntimeError(
-        f"YOLO model not found at: {MODEL_PATH}"
-    )
+MODEL_CACHE_DIR = BASE_DIR / ".model_cache"
+MODEL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
-model = YOLO(str(MODEL_PATH))
+MODEL_FILE = MODEL_CACHE_DIR / "best.pt"
 
-
-# ============================================================
-# CONSTANTS
-# ============================================================
-
-CONFIDENCE_THRESHOLD = 0.50
-IOU_THRESHOLD = 0.50
-
-ALLOWED_EXTENSIONS = {
-    ".jpg",
-    ".jpeg",
-    ".png",
-    ".webp",
-}
+HF_REPO_ID = "Saurav460/AutoInspect-India-model"
+HF_FILENAME = "best.pt"
 
 CLASS_NAMES = [
     "dent",
@@ -102,444 +89,354 @@ CLASS_NAMES = [
     "tire flat",
 ]
 
+CONFIDENCE_THRESHOLD = 0.50
+COMPARE_IOU_THRESHOLD = 0.50
 
-# ============================================================
-# UTILITY FUNCTIONS
-# ============================================================
+# =========================================================
+# DOWNLOAD MODEL FROM HUGGING FACE
+# =========================================================
 
-def generate_inspection_id():
-    timestamp = datetime.now().strftime(
-        "%Y%m%d-%H%M%S"
+if not MODEL_FILE.exists():
+    downloaded_model = hf_hub_download(
+        repo_id=HF_REPO_ID,
+        filename=HF_FILENAME,
+        local_dir=str(MODEL_CACHE_DIR),
     )
 
-    short_id = uuid.uuid4().hex[:6].upper()
+    downloaded_path = Path(downloaded_model)
 
-    return f"AI-{timestamp}-{short_id}"
+    if downloaded_path.exists() and downloaded_path != MODEL_FILE:
+        shutil.copy2(downloaded_path, MODEL_FILE)
 
+# =========================================================
+# LOAD MODEL ONCE
+# =========================================================
 
-def current_timestamp():
-    return datetime.now().isoformat(
-        timespec="seconds"
-    )
+model = YOLO(str(MODEL_FILE))
 
-
-def validate_extension(filename):
-    if not filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is required",
-        )
-
-    extension = Path(filename).suffix.lower()
-
-    if extension not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported file format. "
-                "Use JPG, JPEG, PNG or WEBP."
-            ),
-        )
-
-    return extension
+# =========================================================
+# HELPERS
+# =========================================================
 
 
-def save_upload(file, inspection_id):
-    extension = validate_extension(file.filename)
-
-    unique_filename = (
-        f"{inspection_id}-{uuid.uuid4().hex}"
-        f"{extension}"
-    )
-
-    file_path = TEMP_DIR / unique_filename
-
-    with open(file_path, "wb") as buffer:
-        buffer.write(file.file.read())
-
-    return file_path
+def generate_inspection_id() -> str:
+    timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    random_part = uuid4().hex[:6].upper()
+    return f"AI-{timestamp}-{random_part}"
 
 
-def validate_image(image_path):
-    image = cv2.imread(str(image_path))
-
-    if image is None:
-        raise HTTPException(
-            status_code=400,
-            detail="Uploaded file is not a valid image.",
-        )
-
-    return image
+def get_timestamp() -> str:
+    return datetime.now().isoformat(timespec="seconds")
 
 
-def calculate_relative_area(
-    x1,
-    y1,
-    x2,
-    y2,
-    image_width,
-    image_height,
-):
-    box_area = max(0, x2 - x1) * max(0, y2 - y1)
-
-    image_area = image_width * image_height
-
-    if image_area == 0:
+def calculate_bbox_area_percent(
+    x1: float,
+    y1: float,
+    x2: float,
+    y2: float,
+    image_width: float,
+    image_height: float,
+) -> float:
+    if image_width <= 0 or image_height <= 0:
         return 0.0
 
-    return round(
-        (box_area / image_area) * 100,
-        2,
-    )
+    width = max(0.0, x2 - x1)
+    height = max(0.0, y2 - y1)
+
+    area = width * height
+    image_area = image_width * image_height
+
+    if image_area <= 0:
+        return 0.0
+
+    return (area / image_area) * 100.0
 
 
-def estimate_severity(relative_area):
+def get_severity(area_percent: float) -> str:
     """
-    Project-level visual heuristic.
+    Project-level visual severity heuristic.
 
-    This is NOT an insurance or industry
-    standard severity classification.
+    < 2%      -> Minor
+    <= 10%    -> Moderate
+    > 10%     -> Severe
+
+    This is NOT an insurance/legal/mechanical industry standard.
     """
-
-    if relative_area < 2:
+    if area_percent < 2:
         return "Minor"
 
-    if relative_area <= 10:
+    if area_percent <= 10:
         return "Moderate"
 
     return "Severe"
 
 
-def get_image_location(
-    center_x,
-    center_y,
-    image_width,
-    image_height,
-):
-    third_width = image_width / 3
-    third_height = image_height / 3
+def get_location(
+    x_center: float,
+    y_center: float,
+    image_width: float,
+    image_height: float,
+) -> str:
 
-    if center_x < third_width:
+    if image_width <= 0 or image_height <= 0:
+        return "Unknown"
+
+    horizontal_ratio = x_center / image_width
+    vertical_ratio = y_center / image_height
+
+    if horizontal_ratio < 0.33:
         horizontal = "Left"
-
-    elif center_x < third_width * 2:
+    elif horizontal_ratio < 0.66:
         horizontal = "Center"
-
     else:
         horizontal = "Right"
 
-    if center_y < third_height:
+    if vertical_ratio < 0.33:
         vertical = "Top"
-
-    elif center_y < third_height * 2:
+    elif vertical_ratio < 0.66:
         vertical = "Middle"
-
     else:
         vertical = "Bottom"
 
     return f"{vertical}-{horizontal}"
 
 
-def calculate_iou(box_a, box_b):
+def calculate_iou(box_a, box_b) -> float:
     ax1, ay1, ax2, ay2 = box_a
     bx1, by1, bx2, by2 = box_b
 
-    intersection_x1 = max(ax1, bx1)
-    intersection_y1 = max(ay1, by1)
+    inter_x1 = max(ax1, bx1)
+    inter_y1 = max(ay1, by1)
+    inter_x2 = min(ax2, bx2)
+    inter_y2 = min(ay2, by2)
 
-    intersection_x2 = min(ax2, bx2)
-    intersection_y2 = min(ay2, by2)
+    inter_width = max(0.0, inter_x2 - inter_x1)
+    inter_height = max(0.0, inter_y2 - inter_y1)
 
-    intersection_width = max(
-        0,
-        intersection_x2 - intersection_x1,
-    )
+    intersection = inter_width * inter_height
 
-    intersection_height = max(
-        0,
-        intersection_y2 - intersection_y1,
-    )
+    area_a = max(0.0, ax2 - ax1) * max(0.0, ay2 - ay1)
+    area_b = max(0.0, bx2 - bx1) * max(0.0, by2 - by1)
 
-    intersection_area = (
-        intersection_width
-        * intersection_height
-    )
+    union = area_a + area_b - intersection
 
-    area_a = (
-        max(0, ax2 - ax1)
-        * max(0, ay2 - ay1)
-    )
-
-    area_b = (
-        max(0, bx2 - bx1)
-        * max(0, by2 - by1)
-    )
-
-    union_area = (
-        area_a
-        + area_b
-        - intersection_area
-    )
-
-    if union_area <= 0:
+    if union <= 0:
         return 0.0
 
-    return intersection_area / union_area
+    return intersection / union
 
 
-# ============================================================
-# YOLO DETECTION
-# ============================================================
+def validate_extension(filename: str) -> bool:
+    allowed_extensions = {
+        ".jpg",
+        ".jpeg",
+        ".png",
+        ".webp",
+    }
 
-def get_detections(image_path):
-    image = validate_image(image_path)
+    extension = Path(filename).suffix.lower()
 
-    image_height, image_width = image.shape[:2]
-
-    results = model(
-        str(image_path),
-        conf=CONFIDENCE_THRESHOLD,
-        verbose=False,
-    )
-
-    detections = []
-
-    for result in results:
-
-        if result.boxes is None:
-            continue
-
-        boxes = result.boxes
-
-        for i in range(len(boxes)):
-
-            confidence = float(
-                boxes.conf[i].item()
-            )
-
-            class_id = int(
-                boxes.cls[i].item()
-            )
-
-            x1, y1, x2, y2 = (
-                boxes.xyxy[i]
-                .tolist()
-            )
-
-            x1 = round(float(x1), 2)
-            y1 = round(float(y1), 2)
-            x2 = round(float(x2), 2)
-            y2 = round(float(y2), 2)
-
-            relative_area = (
-                calculate_relative_area(
-                    x1,
-                    y1,
-                    x2,
-                    y2,
-                    image_width,
-                    image_height,
-                )
-            )
-
-            center_x = (
-                x1 + x2
-            ) / 2
-
-            center_y = (
-                y1 + y2
-            ) / 2
-
-            location = get_image_location(
-                center_x,
-                center_y,
-                image_width,
-                image_height,
-            )
-
-            severity = estimate_severity(
-                relative_area
-            )
-
-            if 0 <= class_id < len(CLASS_NAMES):
-                damage_type = CLASS_NAMES[
-                    class_id
-                ]
-            else:
-                damage_type = "unknown"
-
-            detections.append(
-                {
-                    "type": damage_type,
-                    "confidence": round(
-                        confidence,
-                        4,
-                    ),
-                    "bounding_box": [
-                        x1,
-                        y1,
-                        x2,
-                        y2,
-                    ],
-                    "relative_area": relative_area,
-                    "location": location,
-                    "severity": severity,
-                }
-            )
-
-    return detections
+    return extension in allowed_extensions
 
 
-# ============================================================
-# REPORT STORAGE
-# ============================================================
+async def save_upload_file(upload_file: UploadFile, destination: Path):
+    try:
+        with destination.open("wb") as buffer:
+            shutil.copyfileobj(upload_file.file, buffer)
+    except Exception:
+        if destination.exists():
+            destination.unlink()
+        raise
 
-def save_report_json(report):
-    report_id = report["inspection_id"]
 
-    report_path = (
-        REPORT_DIR
-        / f"{report_id}.json"
-    )
+def cleanup_file(path: Optional[Path]):
+    if path and path.exists():
+        try:
+            path.unlink()
+        except Exception:
+            pass
 
-    with open(
-        report_path,
-        "w",
-        encoding="utf-8",
-    ) as file:
-        json.dump(
-            report,
-            file,
-            indent=2,
-            ensure_ascii=False,
-        )
+
+def save_report(report_data: dict):
+    inspection_id = report_data["inspection_id"]
+
+    report_path = REPORT_DIR / f"{inspection_id}.json"
+
+    with report_path.open("w", encoding="utf-8") as file:
+        json.dump(report_data, file, indent=2, ensure_ascii=False)
 
     return report_path
 
 
-# ============================================================
+def read_report(inspection_id: str) -> dict:
+    report_path = REPORT_DIR / f"{inspection_id}.json"
+
+    if not report_path.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Report not found",
+        )
+
+    try:
+        with report_path.open("r", encoding="utf-8") as file:
+            return json.load(file)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to read report: {str(exc)}",
+        )
+
+
+# =========================================================
+# YOLO DETECTION
+# =========================================================
+
+
+def get_detections(image_path: Path) -> list:
+    try:
+        results = model.predict(
+            source=str(image_path),
+            conf=CONFIDENCE_THRESHOLD,
+            imgsz=320,
+            device="cpu",
+            verbose=False,
+        )
+
+        if not results:
+            return []
+
+        result = results[0]
+
+        detections = []
+
+        image_height, image_width = result.orig_shape[:2]
+
+        if result.boxes is None:
+            return []
+
+        for box in result.boxes:
+
+            coordinates = box.xyxy[0].tolist()
+
+            x1, y1, x2, y2 = [
+                float(value) for value in coordinates
+            ]
+
+            confidence = float(box.conf[0].item())
+
+            class_id = int(box.cls[0].item())
+
+            if class_id < 0 or class_id >= len(CLASS_NAMES):
+                class_name = f"class_{class_id}"
+            else:
+                class_name = CLASS_NAMES[class_id]
+
+            width = max(0.0, x2 - x1)
+            height = max(0.0, y2 - y1)
+
+            x_center = x1 + width / 2
+            y_center = y1 + height / 2
+
+            area_percent = calculate_bbox_area_percent(
+                x1,
+                y1,
+                x2,
+                y2,
+                image_width,
+                image_height,
+            )
+
+            severity = get_severity(area_percent)
+
+            location = get_location(
+                x_center,
+                y_center,
+                image_width,
+                image_height,
+            )
+
+            detection = {
+                "class_id": class_id,
+                "damage_type": class_name,
+                "confidence": round(confidence * 100, 2),
+                "bbox": [
+                    round(x1, 2),
+                    round(y1, 2),
+                    round(x2, 2),
+                    round(y2, 2),
+                ],
+                "area_percent": round(area_percent, 2),
+                "severity": severity,
+                "location": location,
+                "image_width": image_width,
+                "image_height": image_height,
+            }
+
+            detections.append(detection)
+
+        return detections
+
+    except Exception as exc:
+        raise RuntimeError(
+            f"YOLO inference failed: {str(exc)}"
+        )
+
+
+# =========================================================
 # PDF GENERATION
-# ============================================================
+# =========================================================
 
-def generate_pdf(report):
-    from reportlab.lib import colors
 
-    from reportlab.lib.enums import (
-        TA_CENTER,
-        TA_LEFT,
-    )
-
-    from reportlab.lib.pagesizes import A4
-
-    from reportlab.lib.styles import (
-        getSampleStyleSheet,
-        ParagraphStyle,
-    )
-
-    from reportlab.lib.units import mm
-
-    from reportlab.platypus import (
-        SimpleDocTemplate,
-        Paragraph,
-        Spacer,
-        Table,
-        TableStyle,
-        PageBreak,
-    )
-
-    report_id = report[
-        "inspection_id"
-    ]
-
-    pdf_path = (
-        REPORT_DIR
-        / f"{report_id}.pdf"
-    )
-
-    wine = colors.HexColor(
-        "#8F1D3F"
-    )
-
-    red = colors.HexColor(
-        "#E63956"
-    )
-
-    dark = colors.HexColor(
-        "#15131A"
-    )
-
-    light = colors.HexColor(
-        "#FCE7ED"
-    )
-
-    grey = colors.HexColor(
-        "#6B7280"
-    )
-
-    white = colors.white
-
-    styles = getSampleStyleSheet()
-
-    title_style = ParagraphStyle(
-        "ReportTitle",
-        parent=styles["Title"],
-        fontSize=24,
-        leading=28,
-        textColor=dark,
-        alignment=TA_LEFT,
-        spaceAfter=8,
-    )
-
-    subtitle_style = ParagraphStyle(
-        "Subtitle",
-        parent=styles["Normal"],
-        fontSize=10,
-        leading=15,
-        textColor=grey,
-        spaceAfter=10,
-    )
-
-    section_style = ParagraphStyle(
-        "Section",
-        parent=styles["Heading2"],
-        fontSize=15,
-        leading=18,
-        textColor=wine,
-        spaceBefore=14,
-        spaceAfter=8,
-    )
-
-    body_style = ParagraphStyle(
-        "Body",
-        parent=styles["Normal"],
-        fontSize=9.5,
-        leading=14,
-        textColor=dark,
-    )
-
-    small_style = ParagraphStyle(
-        "Small",
-        parent=styles["Normal"],
-        fontSize=8,
-        leading=11,
-        textColor=grey,
-    )
+def generate_pdf(report_data: dict, pdf_path: Path):
 
     doc = SimpleDocTemplate(
         str(pdf_path),
         pagesize=A4,
-        rightMargin=17 * mm,
-        leftMargin=17 * mm,
-        topMargin=17 * mm,
-        bottomMargin=17 * mm,
-        title="AutoInspect India Inspection Report",
+        rightMargin=40,
+        leftMargin=40,
+        topMargin=40,
+        bottomMargin=40,
+    )
+
+    styles = getSampleStyleSheet()
+
+    title_style = ParagraphStyle(
+        "TitleStyle",
+        parent=styles["Title"],
+        alignment=TA_CENTER,
+        fontSize=22,
+        leading=26,
+        textColor=colors.HexColor("#8f1d3f"),
+        spaceAfter=12,
+    )
+
+    subtitle_style = ParagraphStyle(
+        "SubtitleStyle",
+        parent=styles["Normal"],
+        alignment=TA_CENTER,
+        fontSize=10,
+        textColor=colors.HexColor("#666666"),
+        spaceAfter=18,
+    )
+
+    section_style = ParagraphStyle(
+        "SectionStyle",
+        parent=styles["Heading2"],
+        fontSize=14,
+        leading=18,
+        textColor=colors.HexColor("#8f1d3f"),
+        spaceBefore=12,
+        spaceAfter=8,
+    )
+
+    normal_style = ParagraphStyle(
+        "NormalStyle",
+        parent=styles["Normal"],
+        fontSize=9,
+        leading=13,
     )
 
     story = []
-
-    # ========================================================
-    # HEADER
-    # ========================================================
 
     story.append(
         Paragraph(
@@ -550,218 +447,187 @@ def generate_pdf(report):
 
     story.append(
         Paragraph(
-            "AI Vehicle Damage Inspection Report",
+            "AI Car Damage Inspection Report",
             subtitle_style,
         )
     )
 
-    header_data = [
-        [
-            Paragraph(
-                "<b>Inspection ID</b>",
-                body_style,
-            ),
-            Paragraph(
-                report_id,
-                body_style,
-            ),
-        ],
-        [
-            Paragraph(
-                "<b>Report Type</b>",
-                body_style,
-            ),
-            Paragraph(
-                report["report_type"],
-                body_style,
-            ),
-        ],
-        [
-            Paragraph(
-                "<b>Date & Time</b>",
-                body_style,
-            ),
-            Paragraph(
-                report["created_at"],
-                body_style,
-            ),
-        ],
-    ]
-
-    header_table = Table(
-        header_data,
-        colWidths=[
-            40 * mm,
-            125 * mm,
-        ],
-    )
-
-    header_table.setStyle(
-        TableStyle(
-            [
-                (
-                    "BACKGROUND",
-                    (0, 0),
-                    (0, -1),
-                    light,
-                ),
-                (
-                    "BOX",
-                    (0, 0),
-                    (-1, -1),
-                    0.5,
-                    colors.HexColor("#E5D5DA"),
-                ),
-                (
-                    "INNERGRID",
-                    (0, 0),
-                    (-1, -1),
-                    0.25,
-                    colors.HexColor("#E5D5DA"),
-                ),
-                (
-                    "VALIGN",
-                    (0, 0),
-                    (-1, -1),
-                    "MIDDLE",
-                ),
-                (
-                    "LEFTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    8,
-                ),
-                (
-                    "RIGHTPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    8,
-                ),
-                (
-                    "TOPPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    7,
-                ),
-                (
-                    "BOTTOMPADDING",
-                    (0, 0),
-                    (-1, -1),
-                    7,
-                ),
-            ]
-        )
-    )
-
-    story.append(header_table)
-
-    # ========================================================
-    # VEHICLE DETAILS
-    # ========================================================
-
-    vehicle = report.get(
-        "vehicle",
-        {},
-    )
+    # -----------------------------------------------------
+    # General Information
+    # -----------------------------------------------------
 
     story.append(
         Paragraph(
-            "Vehicle Information",
+            "Inspection Information",
             section_style,
         )
     )
 
-    vehicle_data = [
-        [
-            Paragraph(
-                "<b>Registration Number</b>",
-                body_style,
-            ),
-            Paragraph(
-                vehicle.get(
-                    "vehicle_number",
-                    "Not provided",
-                ),
-                body_style,
-            ),
-        ],
-        [
-            Paragraph(
-                "<b>Vehicle Model</b>",
-                body_style,
-            ),
-            Paragraph(
-                vehicle.get(
-                    "vehicle_model",
-                    "Not provided",
-                ),
-                body_style,
-            ),
-        ],
-        [
-            Paragraph(
-                "<b>Customer / Driver</b>",
-                body_style,
-            ),
-            Paragraph(
-                vehicle.get(
-                    "customer_name",
-                    "Not provided",
-                ),
-                body_style,
-            ),
-        ],
-        [
-            Paragraph(
-                "<b>Inspector</b>",
-                body_style,
-            ),
-            Paragraph(
-                vehicle.get(
-                    "inspector_name",
-                    "Not provided",
-                ),
-                body_style,
-            ),
-        ],
+    vehicle = report_data.get("vehicle", {})
+
+    info_data = [
+        ["Inspection ID", report_data.get("inspection_id", "N/A")],
+        ["Created At", report_data.get("created_at", "N/A")],
+        ["Report Type", report_data.get("report_type", "inspection")],
+        ["Vehicle Number", vehicle.get("vehicle_number", "N/A")],
+        ["Vehicle Model", vehicle.get("vehicle_model", "N/A")],
+        ["Customer / Driver", vehicle.get("customer_name", "N/A")],
+        ["Inspector", vehicle.get("inspector_name", "N/A")],
+        ["Status", report_data.get("status", "N/A")],
     ]
 
-    vehicle_table = Table(
-        vehicle_data,
-        colWidths=[
-            55 * mm,
-            110 * mm,
-        ],
+    info_table = Table(
+        info_data,
+        colWidths=[1.8 * inch, 4.6 * inch],
     )
 
-    vehicle_table.setStyle(
+    info_table.setStyle(
         TableStyle(
             [
                 (
                     "BACKGROUND",
                     (0, 0),
                     (0, -1),
-                    colors.HexColor(
-                        "#F8F6F7"
-                    ),
+                    colors.HexColor("#fce7ed"),
                 ),
                 (
-                    "BOX",
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (-1, -1),
+                    colors.HexColor("#222028"),
+                ),
+                (
+                    "GRID",
                     (0, 0),
                     (-1, -1),
                     0.5,
-                    colors.HexColor(
-                        "#E7DFE3"
-                    ),
+                    colors.HexColor("#e7dfe3"),
                 ),
                 (
-                    "INNERGRID",
+                    "VALIGN",
                     (0, 0),
                     (-1, -1),
-                    0.25,
-                    colors.HexColor(
-                        "#E7DFE3"
-                    ),
+                    "TOP",
+                ),
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (0, -1),
+                    "Helvetica-Bold",
+                ),
+                (
+                    "FONTNAME",
+                    (1, 0),
+                    (1, -1),
+                    "Helvetica",
+                ),
+                (
+                    "FONTSIZE",
+                    (0, 0),
+                    (-1, -1),
+                    8,
+                ),
+                (
+                    "LEFTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    6,
+                ),
+                (
+                    "RIGHTPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    6,
+                ),
+                (
+                    "TOPPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    5,
+                ),
+                (
+                    "BOTTOMPADDING",
+                    (0, 0),
+                    (-1, -1),
+                    5,
+                ),
+            ]
+        )
+    )
+
+    story.append(info_table)
+    story.append(Spacer(1, 18))
+
+    # -----------------------------------------------------
+    # Inspection summary
+    # -----------------------------------------------------
+
+    story.append(
+        Paragraph(
+            "Inspection Summary",
+            section_style,
+        )
+    )
+
+    summary = report_data.get("summary", {})
+
+    summary_data = [
+        [
+            "Total Damage",
+            str(summary.get("damage_count", 0)),
+        ],
+        [
+            "Existing Damage",
+            str(summary.get("existing_damage_count", 0)),
+        ],
+        [
+            "Potential New Damage",
+            str(summary.get("new_damage_count", 0)),
+        ],
+        [
+            "Status",
+            str(report_data.get("status", "N/A")),
+        ],
+    ]
+
+    summary_table = Table(
+        summary_data,
+        colWidths=[3.2 * inch, 3.2 * inch],
+    )
+
+    summary_table.setStyle(
+        TableStyle(
+            [
+                (
+                    "BACKGROUND",
+                    (0, 0),
+                    (0, -1),
+                    colors.HexColor("#8f1d3f"),
+                ),
+                (
+                    "TEXTCOLOR",
+                    (0, 0),
+                    (0, -1),
+                    colors.white,
+                ),
+                (
+                    "GRID",
+                    (0, 0),
+                    (-1, -1),
+                    0.5,
+                    colors.HexColor("#e7dfe3"),
+                ),
+                (
+                    "FONTNAME",
+                    (0, 0),
+                    (0, -1),
+                    "Helvetica-Bold",
+                ),
+                (
+                    "FONTSIZE",
+                    (0, 0),
+                    (-1, -1),
+                    9,
                 ),
                 (
                     "VALIGN",
@@ -773,140 +639,42 @@ def generate_pdf(report):
                     "LEFTPADDING",
                     (0, 0),
                     (-1, -1),
-                    8,
+                    7,
                 ),
                 (
                     "RIGHTPADDING",
                     (0, 0),
                     (-1, -1),
-                    8,
+                    7,
                 ),
                 (
                     "TOPPADDING",
                     (0, 0),
                     (-1, -1),
-                    7,
+                    6,
                 ),
                 (
                     "BOTTOMPADDING",
                     (0, 0),
                     (-1, -1),
-                    7,
+                    6,
                 ),
             ]
         )
     )
 
-    story.append(vehicle_table)
+    story.append(summary_table)
 
-    # ========================================================
-    # INSPECTION REPORT
-    # ========================================================
+    # -----------------------------------------------------
+    # Damage details
+    # -----------------------------------------------------
 
-    if report["report_type"] == "Single Image Inspection":
+    existing_damage = report_data.get(
+        "existing_damage",
+        report_data.get("results", []),
+    )
 
-        result = report["result"]
-
-        story.append(
-            Paragraph(
-                "Inspection Summary",
-                section_style,
-            )
-        )
-
-        summary_data = [
-            [
-                Paragraph(
-                    "<b>Status</b>",
-                    body_style,
-                ),
-                Paragraph(
-                    result["status"],
-                    body_style,
-                ),
-            ],
-            [
-                Paragraph(
-                    "<b>Total Damage</b>",
-                    body_style,
-                ),
-                Paragraph(
-                    str(
-                        result[
-                            "detection_count"
-                        ]
-                    ),
-                    body_style,
-                ),
-            ],
-        ]
-
-        summary_table = Table(
-            summary_data,
-            colWidths=[
-                55 * mm,
-                110 * mm,
-            ],
-        )
-
-        summary_table.setStyle(
-            TableStyle(
-                [
-                    (
-                        "BACKGROUND",
-                        (0, 0),
-                        (0, -1),
-                        light,
-                    ),
-                    (
-                        "BOX",
-                        (0, 0),
-                        (-1, -1),
-                        0.5,
-                        colors.HexColor(
-                            "#E7DFE3"
-                        ),
-                    ),
-                    (
-                        "INNERGRID",
-                        (0, 0),
-                        (-1, -1),
-                        0.25,
-                        colors.HexColor(
-                            "#E7DFE3"
-                        ),
-                    ),
-                    (
-                        "VALIGN",
-                        (0, 0),
-                        (-1, -1),
-                        "MIDDLE",
-                    ),
-                    (
-                        "LEFTPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        8,
-                    ),
-                    (
-                        "TOPPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        7,
-                    ),
-                    (
-                        "BOTTOMPADDING",
-                        (0, 0),
-                        (-1, -1),
-                        7,
-                    ),
-                ]
-            )
-        )
-
-        story.append(
-            summary_table
-        )
+    if existing_damage:
 
         story.append(
             Paragraph(
@@ -915,407 +683,126 @@ def generate_pdf(report):
             )
         )
 
-        detections = result.get(
-            "detections",
-            [],
-        )
-
-        if not detections:
-
-            story.append(
-                Paragraph(
-                    "No visible damage was detected above the configured confidence threshold.",
-                    body_style,
-                )
-            )
-
-        else:
-
-            damage_data = [
-                [
-                    "Type",
-                    "Confidence",
-                    "Severity",
-                    "Location",
-                    "Area",
-                ]
+        damage_rows = [
+            [
+                "Damage",
+                "Confidence",
+                "Severity",
+                "Location",
             ]
-
-            for damage in detections:
-
-                damage_data.append(
-                    [
-                        damage["type"].title(),
-                        f'{damage["confidence"] * 100:.1f}%',
-                        damage["severity"],
-                        damage["location"],
-                        f'{damage["relative_area"]}%',
-                    ]
-                )
-
-            damage_table = Table(
-                damage_data,
-                colWidths=[
-                    37 * mm,
-                    28 * mm,
-                    29 * mm,
-                    36 * mm,
-                    25 * mm,
-                ],
-                repeatRows=1,
-            )
-
-            damage_table.setStyle(
-                TableStyle(
-                    [
-                        (
-                            "BACKGROUND",
-                            (0, 0),
-                            (-1, 0),
-                            wine,
-                        ),
-                        (
-                            "TEXTCOLOR",
-                            (0, 0),
-                            (-1, 0),
-                            white,
-                        ),
-                        (
-                            "FONTNAME",
-                            (0, 0),
-                            (-1, 0),
-                            "Helvetica-Bold",
-                        ),
-                        (
-                            "FONTSIZE",
-                            (0, 0),
-                            (-1, -1),
-                            8,
-                        ),
-                        (
-                            "GRID",
-                            (0, 0),
-                            (-1, -1),
-                            0.35,
-                            colors.HexColor(
-                                "#DDCCD2"
-                            ),
-                        ),
-                        (
-                            "ROWBACKGROUNDS",
-                            (0, 1),
-                            (-1, -1),
-                            [
-                                white,
-                                colors.HexColor(
-                                    "#FCF8FA"
-                                ),
-                            ],
-                        ),
-                        (
-                            "VALIGN",
-                            (0, 0),
-                            (-1, -1),
-                            "MIDDLE",
-                        ),
-                        (
-                            "LEFTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "RIGHTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "TOPPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                        (
-                            "BOTTOMPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                    ]
-                )
-            )
-
-            story.append(
-                damage_table
-            )
-
-    # ========================================================
-    # COMPARISON REPORT
-    # ========================================================
-
-    else:
-
-        result = report["result"]
-
-        story.append(
-            Paragraph(
-                "Comparison Summary",
-                section_style,
-            )
-        )
-
-        comparison_summary = [
-            [
-                Paragraph(
-                    "<b>Overall Status</b>",
-                    body_style,
-                ),
-                Paragraph(
-                    result[
-                        "summary"
-                    ]["overall_status"],
-                    body_style,
-                ),
-            ],
-            [
-                Paragraph(
-                    "<b>Existing Damage</b>",
-                    body_style,
-                ),
-                Paragraph(
-                    str(
-                        result[
-                            "summary"
-                        ][
-                            "existing_damage_count"
-                        ]
-                    ),
-                    body_style,
-                ),
-            ],
-            [
-                Paragraph(
-                    "<b>Potential New Damage</b>",
-                    body_style,
-                ),
-                Paragraph(
-                    str(
-                        result[
-                            "summary"
-                        ][
-                            "potential_new_damage_count"
-                        ]
-                    ),
-                    body_style,
-                ),
-            ],
         ]
 
-        comparison_table = Table(
-            comparison_summary,
+        for item in existing_damage:
+
+            damage_rows.append(
+                [
+                    str(item.get("damage_type", "N/A")),
+                    f'{item.get("confidence", 0)}%',
+                    str(item.get("severity", "N/A")),
+                    str(item.get("location", "N/A")),
+                ]
+            )
+
+        damage_table = Table(
+            damage_rows,
             colWidths=[
-                55 * mm,
-                110 * mm,
+                2.0 * inch,
+                1.3 * inch,
+                1.3 * inch,
+                1.8 * inch,
             ],
+            repeatRows=1,
         )
 
-        comparison_table.setStyle(
+        damage_table.setStyle(
             TableStyle(
                 [
                     (
                         "BACKGROUND",
                         (0, 0),
-                        (0, -1),
-                        light,
+                        (-1, 0),
+                        colors.HexColor("#8f1d3f"),
                     ),
                     (
-                        "BOX",
+                        "TEXTCOLOR",
+                        (0, 0),
+                        (-1, 0),
+                        colors.white,
+                    ),
+                    (
+                        "FONTNAME",
+                        (0, 0),
+                        (-1, 0),
+                        "Helvetica-Bold",
+                    ),
+                    (
+                        "GRID",
                         (0, 0),
                         (-1, -1),
                         0.5,
-                        colors.HexColor(
-                            "#E7DFE3"
-                        ),
+                        colors.HexColor("#e7dfe3"),
                     ),
                     (
-                        "INNERGRID",
-                        (0, 0),
-                        (-1, -1),
-                        0.25,
-                        colors.HexColor(
-                            "#E7DFE3"
-                        ),
-                    ),
-                    (
-                        "LEFTPADDING",
+                        "FONTSIZE",
                         (0, 0),
                         (-1, -1),
                         8,
                     ),
                     (
+                        "VALIGN",
+                        (0, 0),
+                        (-1, -1),
+                        "MIDDLE",
+                    ),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [
+                            colors.white,
+                            colors.HexColor("#fdf7f9"),
+                        ],
+                    ),
+                    (
+                        "LEFTPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
+                    (
+                        "RIGHTPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
+                    (
                         "TOPPADDING",
                         (0, 0),
                         (-1, -1),
-                        7,
+                        5,
                     ),
                     (
                         "BOTTOMPADDING",
                         (0, 0),
                         (-1, -1),
-                        7,
+                        5,
                     ),
                 ]
             )
         )
 
-        story.append(
-            comparison_table
-        )
+        story.append(damage_table)
 
-        # ----------------------------------------------------
-        # EXISTING DAMAGE
-        # ----------------------------------------------------
+    # -----------------------------------------------------
+    # Potential new damage
+    # -----------------------------------------------------
 
-        story.append(
-            Paragraph(
-                "Existing Damage",
-                section_style,
-            )
-        )
+    new_damage = report_data.get(
+        "potential_new_damage",
+        [],
+    )
 
-        existing_damage = result.get(
-            "existing_damage",
-            [],
-        )
-
-        if not existing_damage:
-
-            story.append(
-                Paragraph(
-                    "No existing damage matches were found.",
-                    body_style,
-                )
-            )
-
-        else:
-
-            existing_data = [
-                [
-                    "Type",
-                    "Confidence",
-                    "IoU",
-                    "Severity",
-                    "Location",
-                ]
-            ]
-
-            for damage in existing_damage:
-
-                existing_data.append(
-                    [
-                        damage["type"].title(),
-                        f'{damage["confidence"] * 100:.1f}%',
-                        str(damage["iou"]),
-                        damage["severity"],
-                        damage["location"],
-                    ]
-                )
-
-            existing_table = Table(
-                existing_data,
-                colWidths=[
-                    37 * mm,
-                    29 * mm,
-                    22 * mm,
-                    31 * mm,
-                    36 * mm,
-                ],
-                repeatRows=1,
-            )
-
-            existing_table.setStyle(
-                TableStyle(
-                    [
-                        (
-                            "BACKGROUND",
-                            (0, 0),
-                            (-1, 0),
-                            wine,
-                        ),
-                        (
-                            "TEXTCOLOR",
-                            (0, 0),
-                            (-1, 0),
-                            white,
-                        ),
-                        (
-                            "FONTNAME",
-                            (0, 0),
-                            (-1, 0),
-                            "Helvetica-Bold",
-                        ),
-                        (
-                            "FONTSIZE",
-                            (0, 0),
-                            (-1, -1),
-                            8,
-                        ),
-                        (
-                            "GRID",
-                            (0, 0),
-                            (-1, -1),
-                            0.35,
-                            colors.HexColor(
-                                "#DDCCD2"
-                            ),
-                        ),
-                        (
-                            "ROWBACKGROUNDS",
-                            (0, 1),
-                            (-1, -1),
-                            [
-                                white,
-                                colors.HexColor(
-                                    "#FCF8FA"
-                                ),
-                            ],
-                        ),
-                        (
-                            "LEFTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "RIGHTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "TOPPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                        (
-                            "BOTTOMPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                    ]
-                )
-            )
-
-            story.append(
-                existing_table
-            )
-
-        # ----------------------------------------------------
-        # NEW DAMAGE
-        # ----------------------------------------------------
+    if new_damage:
 
         story.append(
             Paragraph(
@@ -1324,312 +811,316 @@ def generate_pdf(report):
             )
         )
 
-        new_damage = result.get(
-            "potential_new_damage",
-            [],
+        new_rows = [
+            [
+                "Damage",
+                "Confidence",
+                "Severity",
+                "Location",
+            ]
+        ]
+
+        for item in new_damage:
+
+            new_rows.append(
+                [
+                    str(item.get("damage_type", "N/A")),
+                    f'{item.get("confidence", 0)}%',
+                    str(item.get("severity", "N/A")),
+                    str(item.get("location", "N/A")),
+                ]
+            )
+
+        new_table = Table(
+            new_rows,
+            colWidths=[
+                2.0 * inch,
+                1.3 * inch,
+                1.3 * inch,
+                1.8 * inch,
+            ],
+            repeatRows=1,
         )
 
-        if not new_damage:
-
-            story.append(
-                Paragraph(
-                    "No potential new damage was detected.",
-                    body_style,
-                )
-            )
-
-        else:
-
-            new_data = [
+        new_table.setStyle(
+            TableStyle(
                 [
-                    "Type",
-                    "Confidence",
-                    "Severity",
-                    "Location",
-                    "Area",
+                    (
+                        "BACKGROUND",
+                        (0, 0),
+                        (-1, 0),
+                        colors.HexColor("#c92845"),
+                    ),
+                    (
+                        "TEXTCOLOR",
+                        (0, 0),
+                        (-1, 0),
+                        colors.white,
+                    ),
+                    (
+                        "FONTNAME",
+                        (0, 0),
+                        (-1, 0),
+                        "Helvetica-Bold",
+                    ),
+                    (
+                        "GRID",
+                        (0, 0),
+                        (-1, -1),
+                        0.5,
+                        colors.HexColor("#e7dfe3"),
+                    ),
+                    (
+                        "FONTSIZE",
+                        (0, 0),
+                        (-1, -1),
+                        8,
+                    ),
+                    (
+                        "ROWBACKGROUNDS",
+                        (0, 1),
+                        (-1, -1),
+                        [
+                            colors.white,
+                            colors.HexColor("#fdf7f9"),
+                        ],
+                    ),
+                    (
+                        "LEFTPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
+                    (
+                        "RIGHTPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
+                    (
+                        "TOPPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
+                    (
+                        "BOTTOMPADDING",
+                        (0, 0),
+                        (-1, -1),
+                        5,
+                    ),
                 ]
-            ]
-
-            for damage in new_damage:
-
-                new_data.append(
-                    [
-                        damage["type"].title(),
-                        f'{damage["confidence"] * 100:.1f}%',
-                        damage["severity"],
-                        damage["location"],
-                        f'{damage["relative_area"]}%',
-                    ]
-                )
-
-            new_table = Table(
-                new_data,
-                colWidths=[
-                    37 * mm,
-                    29 * mm,
-                    31 * mm,
-                    36 * mm,
-                    25 * mm,
-                ],
-                repeatRows=1,
             )
+        )
 
-            new_table.setStyle(
-                TableStyle(
-                    [
-                        (
-                            "BACKGROUND",
-                            (0, 0),
-                            (-1, 0),
-                            red,
-                        ),
-                        (
-                            "TEXTCOLOR",
-                            (0, 0),
-                            (-1, 0),
-                            white,
-                        ),
-                        (
-                            "FONTNAME",
-                            (0, 0),
-                            (-1, 0),
-                            "Helvetica-Bold",
-                        ),
-                        (
-                            "FONTSIZE",
-                            (0, 0),
-                            (-1, -1),
-                            8,
-                        ),
-                        (
-                            "GRID",
-                            (0, 0),
-                            (-1, -1),
-                            0.35,
-                            colors.HexColor(
-                                "#E8CCD3"
-                            ),
-                        ),
-                        (
-                            "ROWBACKGROUNDS",
-                            (0, 1),
-                            (-1, -1),
-                            [
-                                colors.HexColor(
-                                    "#FFF7F9"
-                                ),
-                                white,
-                            ],
-                        ),
-                        (
-                            "LEFTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "RIGHTPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            5,
-                        ),
-                        (
-                            "TOPPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                        (
-                            "BOTTOMPADDING",
-                            (0, 0),
-                            (-1, -1),
-                            6,
-                        ),
-                    ]
-                )
-            )
+        story.append(new_table)
 
-            story.append(
-                new_table
-            )
+    # -----------------------------------------------------
+    # Disclaimer
+    # -----------------------------------------------------
 
-    # ========================================================
-    # DISCLAIMER
-    # ========================================================
-
-    story.append(
-        Spacer(1, 15)
-    )
+    story.append(Spacer(1, 18))
 
     disclaimer = (
-        "<b>Important:</b> This report contains "
-        "AI-generated visual inspection results. "
-        "Severity is based on a project-level "
-        "visual heuristic and is not an insurance, "
-        "legal, mechanical, or industry-standard "
-        "assessment. Potential new damage should "
-        "be manually verified."
+        "<b>Disclaimer:</b> This report is generated using AI-based "
+        "visual inspection. Severity is a project-level visual heuristic "
+        "and is not an insurance, legal, mechanical, or industry-standard "
+        "assessment. Potential new damage should be manually verified."
     )
 
     story.append(
         Paragraph(
             disclaimer,
-            small_style,
-        )
-    )
-
-    story.append(
-        Spacer(1, 8)
-    )
-
-    story.append(
-        Paragraph(
-            "Generated by AutoInspect India",
-            small_style,
+            normal_style,
         )
     )
 
     doc.build(story)
 
-    return pdf_path
 
+# =========================================================
+# ROOT
+# =========================================================
 
-# ============================================================
-# HOME
-# ============================================================
 
 @app.get("/")
 def root():
     return {
-        "message": "AutoInspect India API is running!",
-        "model": "YOLO",
+        "status": "online",
+        "service": "AutoInspect India API",
         "version": "1.0.0",
     }
 
 
-# ============================================================
+# =========================================================
 # INSPECT
-# ============================================================
+# =========================================================
+
 
 @app.post("/inspect")
 async def inspect(
     file: UploadFile = File(...),
-
     vehicle_number: str = Form(""),
     vehicle_model: str = Form(""),
     customer_name: str = Form(""),
     inspector_name: str = Form(""),
 ):
-    inspection_id = generate_inspection_id()
 
-    image_path = None
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="No file selected",
+        )
+
+    if not validate_extension(file.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported image format",
+        )
+
+    inspection_id = generate_inspection_id()
+    created_at = get_timestamp()
+
+    extension = Path(file.filename).suffix.lower()
+
+    temp_path = TEMP_DIR / f"{inspection_id}{extension}"
 
     try:
 
-        image_path = save_upload(
+        await save_upload_file(
             file,
-            inspection_id,
+            temp_path,
         )
 
-        detections = get_detections(
-            image_path
-        )
+        detections = get_detections(temp_path)
 
         status = (
             "Damage Detected"
             if detections
-            else "No Visible Damage Detected"
+            else "No Damage Detected"
         )
 
-        result = {
-            "filename": file.filename,
-
-            "detections": detections,
-
-            "detection_count": len(
-                detections
+        report_data = {
+            "inspection_id": inspection_id,
+            "created_at": created_at,
+            "report_type": "inspection",
+            "vehicle": {
+                "vehicle_number": vehicle_number,
+                "vehicle_model": vehicle_model,
+                "customer_name": customer_name,
+                "inspector_name": inspector_name,
+            },
+            "results": detections,
+            "summary": {
+                "damage_count": len(detections),
+                "existing_damage_count": len(detections),
+                "new_damage_count": 0,
+            },
+            "status": status,
+            "disclaimer": (
+                "AI-generated visual inspection. Severity is a "
+                "project-level heuristic and requires manual verification."
             ),
+        }
 
+        save_report(report_data)
+
+        return {
+            "success": True,
+            "inspection_id": inspection_id,
+            "timestamp": created_at,
+            "vehicle": report_data["vehicle"],
+            "results": detections,
+            "summary": report_data["summary"],
             "status": status,
         }
 
-        report = {
-            "inspection_id": inspection_id,
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
 
-            "created_at": current_timestamp(),
-
-            "report_type":
-                "Single Image Inspection",
-
-            "vehicle": {
-                "vehicle_number":
-                    vehicle_number.strip(),
-
-                "vehicle_model":
-                    vehicle_model.strip(),
-
-                "customer_name":
-                    customer_name.strip(),
-
-                "inspector_name":
-                    inspector_name.strip(),
-            },
-
-            "result": result,
-        }
-
-        save_report_json(report)
-
-        return {
-            **result,
-
-            "inspection_id":
-                inspection_id,
-
-            "created_at":
-                report["created_at"],
-
-            "vehicle":
-                report["vehicle"],
-        }
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Inspection failed: {str(exc)}",
+        )
 
     finally:
-
-        if image_path and image_path.exists():
-            image_path.unlink(
-                missing_ok=True
-            )
+        cleanup_file(temp_path)
 
 
-# ============================================================
-# COMPARE
-# ============================================================
+# =========================================================
+# COMPARE BEFORE / AFTER
+# =========================================================
+
 
 @app.post("/compare")
 async def compare(
     before_image: UploadFile = File(...),
     after_image: UploadFile = File(...),
-
     vehicle_number: str = Form(""),
     vehicle_model: str = Form(""),
     customer_name: str = Form(""),
     inspector_name: str = Form(""),
 ):
-    inspection_id = generate_inspection_id()
 
-    before_path = None
-    after_path = None
+    if not before_image.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Before image is required",
+        )
+
+    if not after_image.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="After image is required",
+        )
+
+    if not validate_extension(before_image.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported before image format",
+        )
+
+    if not validate_extension(after_image.filename):
+        raise HTTPException(
+            status_code=400,
+            detail="Unsupported after image format",
+        )
+
+    inspection_id = generate_inspection_id()
+    created_at = get_timestamp()
+
+    before_extension = Path(
+        before_image.filename
+    ).suffix.lower()
+
+    after_extension = Path(
+        after_image.filename
+    ).suffix.lower()
+
+    before_path = (
+        TEMP_DIR
+        / f"{inspection_id}_before{before_extension}"
+    )
+
+    after_path = (
+        TEMP_DIR
+        / f"{inspection_id}_after{after_extension}"
+    )
 
     try:
 
-        before_path = save_upload(
+        await save_upload_file(
             before_image,
-            inspection_id,
+            before_path,
         )
 
-        after_path = save_upload(
+        await save_upload_file(
             after_image,
-            inspection_id,
+            after_path,
         )
 
         before_detections = get_detections(
@@ -1640,233 +1131,187 @@ async def compare(
             after_path
         )
 
-        used_before_indices = set()
-
+        matched_before = set()
+        potential_new_damage = []
         existing_damage = []
 
-        potential_new_damage = []
+        # -------------------------------------------------
+        # Match after detections to before detections
+        # -------------------------------------------------
 
-        # ----------------------------------------------------
-        # Match AFTER detections to BEFORE detections
-        # ----------------------------------------------------
-
-        for after_damage in after_detections:
+        for after_index, after_item in enumerate(
+            after_detections
+        ):
 
             best_match_index = None
             best_iou = 0.0
 
-            for i, before_damage in enumerate(
+            for before_index, before_item in enumerate(
                 before_detections
             ):
 
-                if i in used_before_indices:
+                if before_index in matched_before:
                     continue
 
+                # Only same damage class can match
                 if (
-                    before_damage["type"]
-                    != after_damage["type"]
+                    after_item["class_id"]
+                    != before_item["class_id"]
                 ):
                     continue
 
                 iou = calculate_iou(
-                    before_damage[
-                        "bounding_box"
-                    ],
-                    after_damage[
-                        "bounding_box"
-                    ],
+                    after_item["bbox"],
+                    before_item["bbox"],
                 )
 
                 if iou > best_iou:
                     best_iou = iou
-                    best_match_index = i
+                    best_match_index = before_index
 
             if (
                 best_match_index is not None
-                and best_iou >= IOU_THRESHOLD
+                and best_iou >= COMPARE_IOU_THRESHOLD
             ):
 
-                used_before_indices.add(
+                matched_before.add(
                     best_match_index
                 )
 
+                matched_item = dict(after_item)
+
+                matched_item["match_type"] = "existing"
+                matched_item["iou"] = round(
+                    best_iou,
+                    3,
+                )
+
                 existing_damage.append(
-                    {
-                        "type":
-                            after_damage[
-                                "type"
-                            ],
-
-                        "confidence":
-                            after_damage[
-                                "confidence"
-                            ],
-
-                        "iou":
-                            round(
-                                best_iou,
-                                4,
-                            ),
-
-                        "relative_area":
-                            after_damage[
-                                "relative_area"
-                            ],
-
-                        "location":
-                            after_damage[
-                                "location"
-                            ],
-
-                        "severity":
-                            after_damage[
-                                "severity"
-                            ],
-                    }
+                    matched_item
                 )
 
             else:
 
-                potential_new_damage.append(
-                    {
-                        "type":
-                            after_damage[
-                                "type"
-                            ],
+                new_item = dict(after_item)
 
-                        "confidence":
-                            after_damage[
-                                "confidence"
-                            ],
-
-                        "bounding_box":
-                            after_damage[
-                                "bounding_box"
-                            ],
-
-                        "relative_area":
-                            after_damage[
-                                "relative_area"
-                            ],
-
-                        "location":
-                            after_damage[
-                                "location"
-                            ],
-
-                        "severity":
-                            after_damage[
-                                "severity"
-                            ],
-                    }
+                new_item["match_type"] = (
+                    "potential_new"
                 )
 
-        overall_status = (
-            "Potential New Damage Detected"
-            if potential_new_damage
-            else "No Potential New Damage Detected"
-        )
+                new_item["iou"] = 0.0
 
-        result = {
-            "before_filename":
-                before_image.filename,
+                potential_new_damage.append(
+                    new_item
+                )
 
-            "after_filename":
-                after_image.filename,
+        # -------------------------------------------------
+        # Add unmatched BEFORE damage as existing
+        # -------------------------------------------------
 
-            "existing_damage":
-                existing_damage,
+        for before_index, before_item in enumerate(
+            before_detections
+        ):
 
-            "potential_new_damage":
-                potential_new_damage,
+            if before_index not in matched_before:
 
-            "summary": {
-                "existing_damage_count":
-                    len(existing_damage),
+                existing_item = dict(before_item)
 
-                "potential_new_damage_count":
-                    len(
-                        potential_new_damage
-                    ),
+                existing_item["match_type"] = (
+                    "existing_before_only"
+                )
 
-                "overall_status":
-                    overall_status,
-            },
-        }
+                existing_item["iou"] = 0.0
 
-        report = {
-            "inspection_id":
-                inspection_id,
+                existing_damage.append(
+                    existing_item
+                )
 
-            "created_at":
-                current_timestamp(),
+        # -------------------------------------------------
+        # Status
+        # -------------------------------------------------
 
-            "report_type":
-                "Before / After Comparison",
+        if potential_new_damage:
+            status = "Potential New Damage Detected"
+        elif existing_damage:
+            status = "No New Damage Detected"
+        else:
+            status = "No Damage Detected"
 
+        report_data = {
+            "inspection_id": inspection_id,
+            "created_at": created_at,
+            "report_type": "compare",
             "vehicle": {
-                "vehicle_number":
-                    vehicle_number.strip(),
-
-                "vehicle_model":
-                    vehicle_model.strip(),
-
-                "customer_name":
-                    customer_name.strip(),
-
-                "inspector_name":
-                    inspector_name.strip(),
+                "vehicle_number": vehicle_number,
+                "vehicle_model": vehicle_model,
+                "customer_name": customer_name,
+                "inspector_name": inspector_name,
             },
-
-            "result": result,
+            "before_results": before_detections,
+            "after_results": after_detections,
+            "existing_damage": existing_damage,
+            "potential_new_damage": potential_new_damage,
+            "summary": {
+                "damage_count": len(
+                    after_detections
+                ),
+                "existing_damage_count": len(
+                    existing_damage
+                ),
+                "new_damage_count": len(
+                    potential_new_damage
+                ),
+            },
+            "status": status,
+            "disclaimer": (
+                "Potential new damage is an AI-based visual "
+                "comparison and should be manually verified."
+            ),
         }
 
-        save_report_json(report)
+        save_report(report_data)
 
         return {
-            **result,
-
-            "inspection_id":
-                inspection_id,
-
-            "created_at":
-                report["created_at"],
-
-            "vehicle":
-                report["vehicle"],
+            "success": True,
+            "inspection_id": inspection_id,
+            "timestamp": created_at,
+            "vehicle": report_data["vehicle"],
+            "existing_damage": existing_damage,
+            "potential_new_damage": potential_new_damage,
+            "summary": report_data["summary"],
+            "status": status,
         }
 
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=str(exc),
+        )
+
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Comparison failed: {str(exc)}",
+        )
+
     finally:
-
-        if before_path and before_path.exists():
-            before_path.unlink(
-                missing_ok=True
-            )
-
-        if after_path and after_path.exists():
-            after_path.unlink(
-                missing_ok=True
-            )
+        cleanup_file(before_path)
+        cleanup_file(after_path)
 
 
-# ============================================================
-# DOWNLOAD JSON REPORT
-# ============================================================
+# =========================================================
+# GET REPORT JSON
+# =========================================================
 
-@app.get(
-    "/reports/{inspection_id}/json"
-)
-def download_json_report(
-    inspection_id: str
+
+@app.get("/reports/{inspection_id}/json")
+def download_json(
+    inspection_id: str,
 ):
 
-    report_path = (
-        REPORT_DIR
-        / f"{inspection_id}.json"
-    )
+    report_path = REPORT_DIR / f"{inspection_id}.json"
 
     if not report_path.exists():
-
         raise HTTPException(
             status_code=404,
             detail="Report not found",
@@ -1874,237 +1319,180 @@ def download_json_report(
 
     return FileResponse(
         path=str(report_path),
-
         media_type="application/json",
-
-        filename=(
-            f"AutoInspect-{inspection_id}.json"
-        ),
+        filename=f"{inspection_id}.json",
     )
 
 
-# ============================================================
-# DOWNLOAD PDF REPORT
-# ============================================================
+# =========================================================
+# GET REPORT PDF
+# =========================================================
 
-@app.get(
-    "/reports/{inspection_id}/pdf"
-)
-def download_pdf_report(
-    inspection_id: str
+
+@app.get("/reports/{inspection_id}/pdf")
+def download_pdf(
+    inspection_id: str,
 ):
 
-    report_path = (
-        REPORT_DIR
-        / f"{inspection_id}.json"
+    report_data = read_report(
+        inspection_id
     )
 
-    if not report_path.exists():
+    pdf_path = (
+        REPORT_DIR
+        / f"{inspection_id}.pdf"
+    )
 
-        raise HTTPException(
-            status_code=404,
-            detail="Report not found",
+    try:
+
+        generate_pdf(
+            report_data,
+            pdf_path,
         )
 
-    with open(
-        report_path,
-        "r",
-        encoding="utf-8",
-    ) as file:
+        return FileResponse(
+            path=str(pdf_path),
+            media_type="application/pdf",
+            filename=f"{inspection_id}.pdf",
+        )
 
-        report = json.load(file)
+    except Exception as exc:
 
-    pdf_path = generate_pdf(report)
+        raise HTTPException(
+            status_code=500,
+            detail=f"PDF generation failed: {str(exc)}",
+        )
 
-    return FileResponse(
-        path=str(pdf_path),
 
-        media_type="application/pdf",
+# =========================================================
+# REPORT LIST
+# =========================================================
 
-        filename=(
-            f"AutoInspect-{inspection_id}.pdf"
-        ),
-    )
-
-# ============================================================
-#  INSPECTION HISTORY
-# ============================================================
 
 @app.get("/reports")
-def list_reports(search: str = ""):
-    """
-    Return all saved inspection reports.
-
-    Optional search:
-    - vehicle registration number
-    - vehicle model
-    - customer name
-    - inspection ID
-    """
+def list_reports(
+    search: str = "",
+):
 
     reports = []
 
-    search = search.strip().lower()
+    search_lower = search.strip().lower()
 
-    for report_path in REPORT_DIR.glob("*.json"):
+    for report_file in REPORT_DIR.glob("*.json"):
 
         try:
 
-            with open(
-                report_path,
+            with report_file.open(
                 "r",
                 encoding="utf-8",
             ) as file:
-
                 report = json.load(file)
-
-            inspection_id = report.get(
-                "inspection_id",
-                "",
-            )
-
-            created_at = report.get(
-                "created_at",
-                "",
-            )
-
-            report_type = report.get(
-                "report_type",
-                "",
-            )
 
             vehicle = report.get(
                 "vehicle",
                 {},
             )
 
-            vehicle_number = vehicle.get(
-                "vehicle_number",
-                "",
-            )
-
-            vehicle_model = vehicle.get(
-                "vehicle_model",
-                "",
-            )
-
-            customer_name = vehicle.get(
-                "customer_name",
-                "",
-            )
-
-            result = report.get(
-                "result",
+            summary = report.get(
+                "summary",
                 {},
             )
 
-            if report_type == "Single Image Inspection":
-
-                damage_count = result.get(
-                    "detection_count",
-                    0,
-                )
-
-                existing_damage_count = 0
-
-                new_damage_count = 0
-
-                status = result.get(
-                    "status",
-                    "Unknown",
-                )
-
-            else:
-
-                summary = result.get(
-                    "summary",
-                    {},
-                )
-
-                existing_damage_count = (
-                    summary.get(
-                        "existing_damage_count",
-                        0,
-                    )
-                )
-
-                new_damage_count = (
-                    summary.get(
-                        "potential_new_damage_count",
-                        0,
-                    )
-                )
-
-                damage_count = (
-                    existing_damage_count
-                    + new_damage_count
-                )
-
-                status = summary.get(
-                    "overall_status",
-                    "Unknown",
-                )
-
-            # ----------------------------------------------
-            # SEARCH
-            # ----------------------------------------------
-
-            search_text = " ".join(
+            searchable_text = " ".join(
                 [
-                    inspection_id,
-                    report_type,
-                    vehicle_number,
-                    vehicle_model,
-                    customer_name,
-                    status,
+                    str(
+                        report.get(
+                            "inspection_id",
+                            "",
+                        )
+                    ),
+                    str(
+                        report.get(
+                            "report_type",
+                            "",
+                        )
+                    ),
+                    str(
+                        vehicle.get(
+                            "vehicle_number",
+                            "",
+                        )
+                    ),
+                    str(
+                        vehicle.get(
+                            "vehicle_model",
+                            "",
+                        )
+                    ),
+                    str(
+                        vehicle.get(
+                            "customer_name",
+                            "",
+                        )
+                    ),
+                    str(
+                        report.get(
+                            "status",
+                            "",
+                        )
+                    ),
                 ]
             ).lower()
 
-            if search and search not in search_text:
+            if (
+                search_lower
+                and search_lower not in searchable_text
+            ):
                 continue
 
             reports.append(
                 {
-                    "inspection_id":
-                        inspection_id,
-
-                    "created_at":
-                        created_at,
-
-                    "report_type":
-                        report_type,
-
-                    "vehicle_number":
-                        vehicle_number,
-
-                    "vehicle_model":
-                        vehicle_model,
-
-                    "customer_name":
-                        customer_name,
-
-                    "damage_count":
-                        damage_count,
-
-                    "existing_damage_count":
-                        existing_damage_count,
-
-                    "new_damage_count":
-                        new_damage_count,
-
-                    "status":
-                        status,
+                    "inspection_id": report.get(
+                        "inspection_id",
+                        "",
+                    ),
+                    "created_at": report.get(
+                        "created_at",
+                        "",
+                    ),
+                    "report_type": report.get(
+                        "report_type",
+                        "",
+                    ),
+                    "vehicle_number": vehicle.get(
+                        "vehicle_number",
+                        "",
+                    ),
+                    "vehicle_model": vehicle.get(
+                        "vehicle_model",
+                        "",
+                    ),
+                    "customer_name": vehicle.get(
+                        "customer_name",
+                        "",
+                    ),
+                    "damage_count": summary.get(
+                        "damage_count",
+                        0,
+                    ),
+                    "existing_damage_count": summary.get(
+                        "existing_damage_count",
+                        0,
+                    ),
+                    "new_damage_count": summary.get(
+                        "new_damage_count",
+                        0,
+                    ),
+                    "status": report.get(
+                        "status",
+                        "",
+                    ),
                 }
             )
 
-        except (
-            json.JSONDecodeError,
-            OSError,
-        ):
-            # Skip corrupted/unreadable report files
+        except Exception:
             continue
 
-    # Newest report first
     reports.sort(
         key=lambda item: item.get(
             "created_at",
@@ -2114,75 +1502,41 @@ def list_reports(search: str = ""):
     )
 
     return {
+        "success": True,
         "count": len(reports),
         "reports": reports,
     }
 
 
-# ============================================================
-#   GET SINGLE REPORT
-# ============================================================
+# =========================================================
+# GET SINGLE REPORT
+# =========================================================
 
-@app.get(
-    "/reports/{inspection_id}"
-)
-def get_report(
+
+@app.get("/reports/{inspection_id}")
+def get_single_report(
     inspection_id: str,
 ):
-    """
-    Return complete report JSON
-    for a specific inspection ID.
-    """
 
-    report_path = (
-        REPORT_DIR
-        / f"{inspection_id}.json"
+    report_data = read_report(
+        inspection_id
     )
 
-    if not report_path.exists():
+    return {
+        "success": True,
+        "report": report_data,
+    }
 
-        raise HTTPException(
-            status_code=404,
-            detail="Inspection report not found.",
-        )
 
-    try:
+# =========================================================
+# DELETE REPORT
+# =========================================================
 
-        with open(
-            report_path,
-            "r",
-            encoding="utf-8",
-        ) as file:
-
-            report = json.load(file)
-
-        return report
-
-    except (
-        json.JSONDecodeError,
-        OSError,
-    ):
-
-        raise HTTPException(
-            status_code=500,
-            detail="Unable to read inspection report.",
-        )    
-
-# ============================================================
-#  DELETE REPORT
-# ============================================================
 
 @app.delete("/reports/{inspection_id}")
 def delete_report(
     inspection_id: str,
 ):
-    """
-    Delete a saved inspection report.
-
-    Removes:
-    - JSON report
-    - Generated PDF report
-    """
 
     json_path = (
         REPORT_DIR
@@ -2197,27 +1551,26 @@ def delete_report(
     if not json_path.exists():
         raise HTTPException(
             status_code=404,
-            detail="Inspection report not found.",
+            detail="Report not found",
         )
 
     try:
-        # Delete JSON
-        json_path.unlink(
-            missing_ok=True
-        )
 
-        # Delete PDF if it exists
-        pdf_path.unlink(
-            missing_ok=True
-        )
+        json_path.unlink()
+
+        if pdf_path.exists():
+            pdf_path.unlink()
 
         return {
-            "message": "Inspection report deleted successfully.",
-            "inspection_id": inspection_id,
+            "success": True,
+            "message": (
+                f"Report {inspection_id} deleted successfully"
+            ),
         }
 
-    except OSError as error:
+    except Exception as exc:
+
         raise HTTPException(
             status_code=500,
-            detail=f"Unable to delete report: {error}",
-        )    
+            detail=f"Failed to delete report: {str(exc)}",
+        )
