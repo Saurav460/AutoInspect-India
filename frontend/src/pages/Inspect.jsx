@@ -11,132 +11,179 @@ import DamageCard from "../components/DamageCard";
 import ResultSummary from "../components/ResultSummary";
 import VehicleDetails from "../components/VehicleDetails";
 
-
 function Inspect() {
+  const [file, setFile] = useState(null);
+  const [preview, setPreview] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState("");
 
-  const [file, setFile] =
-    useState(null);
-
-  const [preview, setPreview] =
-    useState("");
-
-  const [result, setResult] =
-    useState(null);
-
-  const [loading, setLoading] =
-    useState(false);
-
-  const [error, setError] =
-    useState("");
-
-  const [vehicle, setVehicle] =
-    useState({
-      vehicle_number: "",
-      vehicle_model: "",
-      customer_name: "",
-      inspector_name: "",
-    });
-
+  const [vehicle, setVehicle] = useState({
+    vehicle_number: "",
+    vehicle_model: "",
+    customer_name: "",
+    inspector_name: "",
+  });
 
   /* =========================================
      FILE CHANGE
   ========================================= */
 
-  const handleFileChange = (
-    event
-  ) => {
-
-    const selectedFile =
-      event.target.files[0];
+  const handleFileChange = (event) => {
+    const selectedFile = event.target.files[0];
 
     if (!selectedFile) {
       return;
     }
 
-    if (
-      !selectedFile.type.startsWith(
-        "image/"
-      )
-    ) {
-      setError(
-        "Please select a valid image file."
-      );
-
+    if (!selectedFile.type.startsWith("image/")) {
+      setError("Please select a valid image file.");
       return;
     }
 
     setFile(selectedFile);
 
-    setPreview(
-      URL.createObjectURL(
-        selectedFile
-      )
-    );
+    setPreview(URL.createObjectURL(selectedFile));
 
     setResult(null);
     setError("");
   };
 
-
   /* =========================================
      INSPECT
   ========================================= */
 
-  const handleInspect =
-    async () => {
+  const handleInspect = async () => {
+    if (!file) {
+      setError("Please select a vehicle image first.");
+      return;
+    }
 
-      if (!file) {
+    try {
+      setLoading(true);
+      setError("");
+      setResult(null);
 
-        setError(
-          "Please select a vehicle image first."
-        );
+      const data = await inspectImage(file, vehicle);
 
-        return;
-      }
+      /*
+        Backend response:
 
-      try {
+        {
+          success: true,
+          inspection_id: "...",
+          timestamp: "...",
+          vehicle: {...},
+          results: [...],
+          summary: {
+            damage_count: 2,
+            existing_damage_count: 2,
+            new_damage_count: 0
+          },
+          status: "Damage Detected"
+        }
 
-        setLoading(true);
-        setError("");
-        setResult(null);
+        Frontend components were expecting:
+        created_at
+        detections
+        detection_count
 
-        const data =
-          await inspectImage(
-            file,
-            vehicle
-          );
+        So we normalize the backend response here.
+      */
 
-        setResult(data);
+      const formattedResult = {
+        ...data,
 
-      } catch (err) {
+        created_at: data.timestamp || "",
 
-        setError(
-          err.message ||
-            "Inspection failed."
-        );
+        detections: Array.isArray(data.results)
+          ? data.results
+          : [],
 
-      } finally {
+        detection_count:
+          data.summary?.damage_count || 0,
+      };
 
-        setLoading(false);
-
-      }
-    };
-
+      setResult(formattedResult);
+    } catch (err) {
+      setError(
+        err.message ||
+          "Inspection failed."
+      );
+    } finally {
+      setLoading(false);
+    }
+  };
 
   /* =========================================
      RESET
   ========================================= */
 
-  const handleNewInspection =
-    () => {
+  const handleNewInspection = () => {
+    setFile(null);
+    setPreview("");
+    setResult(null);
+    setError("");
 
-      setFile(null);
-      setPreview("");
-      setResult(null);
+    // Reset file input if needed
+    const fileInput = document.querySelector(
+      'input[type="file"]'
+    );
+
+    if (fileInput) {
+      fileInput.value = "";
+    }
+  };
+
+  /* =========================================
+     PDF DOWNLOAD
+  ========================================= */
+
+  const handleDownloadPDF = async () => {
+    if (!result?.inspection_id) {
+      return;
+    }
+
+    try {
       setError("");
 
-    };
+      await downloadPDF(
+        result.inspection_id
+      );
+    } catch (err) {
+      setError(
+        err.message ||
+          "Unable to download PDF."
+      );
+    }
+  };
 
+  /* =========================================
+     JSON DOWNLOAD
+  ========================================= */
+
+  const handleDownloadJSON = async () => {
+    if (!result?.inspection_id) {
+      return;
+    }
+
+    try {
+      setError("");
+
+      await downloadJSON(
+        result.inspection_id
+      );
+    } catch (err) {
+      setError(
+        err.message ||
+          "Unable to download JSON."
+      );
+    }
+  };
+
+  /* =========================================
+     UI
+  ========================================= */
 
   return (
     <div className="dashboard-page">
@@ -162,7 +209,6 @@ function Inspect() {
 
       </div>
 
-
       {/* ===================================
           VEHICLE DETAILS
       =================================== */}
@@ -171,7 +217,6 @@ function Inspect() {
         vehicle={vehicle}
         setVehicle={setVehicle}
       />
-
 
       {/* ===================================
           UPLOAD
@@ -198,14 +243,8 @@ function Inspect() {
 
           <input
             type="file"
-            accept="
-              image/jpeg,
-              image/png,
-              image/webp
-            "
-            onChange={
-              handleFileChange
-            }
+            accept="image/jpeg,image/png,image/webp"
+            onChange={handleFileChange}
             hidden
           />
 
@@ -226,7 +265,6 @@ function Inspect() {
         )}
 
       </div>
-
 
       {/* ===================================
           PREVIEW
@@ -257,9 +295,7 @@ function Inspect() {
 
             <button
               className="primary-button"
-              onClick={
-                handleInspect
-              }
+              onClick={handleInspect}
               disabled={loading}
             >
               {loading
@@ -279,7 +315,6 @@ function Inspect() {
 
       )}
 
-
       {/* ===================================
           ERROR
       =================================== */}
@@ -295,7 +330,6 @@ function Inspect() {
 
         </div>
       )}
-
 
       {/* ===================================
           LOADING
@@ -320,7 +354,6 @@ function Inspect() {
 
       )}
 
-
       {/* ===================================
           RESULT
       =================================== */}
@@ -328,6 +361,10 @@ function Inspect() {
       {result && !loading && (
 
         <div className="results-container">
+
+          {/* ===================================
+              RESULT HEADER
+          =================================== */}
 
           <div className="results-heading">
 
@@ -349,6 +386,7 @@ function Inspect() {
               <div className="report-meta">
 
                 <div>
+
                   <span>
                     Inspection ID
                   </span>
@@ -356,82 +394,50 @@ function Inspect() {
                   <strong>
                     {result.inspection_id}
                   </strong>
+
                 </div>
 
                 <div>
+
                   <span>
                     Date &amp; Time
                   </span>
 
                   <strong>
-                    {result.created_at}
+                    {result.created_at ||
+                      result.timestamp ||
+                      "N/A"}
                   </strong>
+
                 </div>
 
               </div>
 
             </div>
 
+            {/* ===================================
+                REPORT ACTIONS
+            =================================== */}
+
             <div className="report-actions">
 
               <button
                 className="report-button"
-                onClick={
-                  async () => {
-
-                    try {
-
-                      await downloadPDF(
-                        result.inspection_id
-                      );
-
-                    } catch (err) {
-
-                      setError(
-                        err.message
-                      );
-
-                    }
-
-                  }
-                }
+                onClick={handleDownloadPDF}
               >
                 ↓ Download PDF
               </button>
 
               <button
-                className="
-                  report-button
-                  secondary-report
-                "
-                onClick={
-                  async () => {
-
-                    try {
-
-                      await downloadJSON(
-                        result.inspection_id
-                      );
-
-                    } catch (err) {
-
-                      setError(
-                        err.message
-                      );
-
-                    }
-
-                  }
-                }
+                className="report-button secondary-report"
+                onClick={handleDownloadJSON}
               >
                 ↓ JSON
               </button>
 
               <button
                 className="secondary-button"
-                onClick={
-                  handleNewInspection
-                }
+                onClick={handleNewInspection}
               >
                 New Inspection
               </button>
@@ -440,15 +446,17 @@ function Inspect() {
 
           </div>
 
-
-          {/* SUMMARY */}
+          {/* ===================================
+              SUMMARY
+          =================================== */}
 
           <ResultSummary
             result={result}
           />
 
-
-          {/* IMAGE */}
+          {/* ===================================
+              IMAGE
+          =================================== */}
 
           <div className="result-image-panel">
 
@@ -471,14 +479,15 @@ function Inspect() {
             <DetectionViewer
               image={preview}
               detections={
-                result.detections
+                result.detections || []
               }
             />
 
           </div>
 
-
-          {/* DAMAGE */}
+          {/* ===================================
+              DAMAGE
+          =================================== */}
 
           <section className="damage-section">
 
@@ -502,9 +511,11 @@ function Inspect() {
 
             </div>
 
+            {/* ===================================
+                NO DAMAGE
+            =================================== */}
 
-            {result.detections.length ===
-            0 ? (
+            {result.detections.length === 0 ? (
 
               <div className="no-damage">
 
@@ -530,13 +541,17 @@ function Inspect() {
 
             ) : (
 
+              /* ===================================
+                 DAMAGE CARDS
+              =================================== */
+
               <div className="damage-grid">
 
                 {result.detections.map(
                   (damage, index) => (
 
                     <DamageCard
-                      key={index}
+                      key={`${damage.damage_type}-${index}`}
                       damage={damage}
                       index={index}
                     />
@@ -549,6 +564,24 @@ function Inspect() {
             )}
 
           </section>
+
+          {/* ===================================
+              STATUS
+          =================================== */}
+
+          {result.status && (
+            <div className="inspection-status">
+
+              <span className="small-label">
+                INSPECTION STATUS
+              </span>
+
+              <strong>
+                {result.status}
+              </strong>
+
+            </div>
+          )}
 
         </div>
       )}
